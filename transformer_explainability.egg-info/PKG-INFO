@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: transformer-explainability
+Version: 0.1.0
+Summary: library based on https://github.com/hila-chefer/Transformer-Explainability
+Author: Elizaveta Dakhova
+License: MIT
+License-File: LICENSE

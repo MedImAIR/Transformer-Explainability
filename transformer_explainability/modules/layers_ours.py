@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from timm.models.layers import DropPath as TimmDropPath
+
 __all__ = ['forward_hook', 'Clone', 'Add', 'Cat', 'ReLU', 'GELU', 'Dropout', 'BatchNorm2d', 'Linear', 'MaxPool2d',
            'AdaptiveAvgPool2d', 'AvgPool2d', 'Conv2d', 'Sequential', 'safe_divide', 'einsum', 'Softmax', 'IndexSelect',
            'LayerNorm', 'AddEye']
@@ -74,21 +76,40 @@ class Softmax(nn.Softmax, RelProp):
     pass
 
 class LayerNorm(nn.LayerNorm, RelProp):
+    """Надо обдумать"""
+    pass
+
+class BatchNorm2d(nn.BatchNorm2d, RelProp):
+    """Надо обдумать"""
     pass
 
 class Dropout(nn.Dropout, RelProp):
     pass
 
+class DropPath(TimmDropPath, RelProp):
+    """
+    Готово
+    """
+    def __init__(self, drop_prob=None):
+        super().__init__(drop_prob=drop_prob)
+        self.drop_prob = drop_prob
 
-class MaxPool2d(nn.MaxPool2d, RelPropSimple):
+    def __repr__(self):
+        msg = super().__repr__()
+        msg += f'(drop_prob={self.drop_prob})'
+        return msg
+
+class Identity(nn.Identity, RelProp):
     pass
 
-class LayerNorm(nn.LayerNorm, RelProp):
+class MaxPool2d(nn.MaxPool2d, RelPropSimple):
     pass
 
 class AdaptiveAvgPool2d(nn.AdaptiveAvgPool2d, RelPropSimple):
     pass
 
+class AdaptiveAvgPool1d(nn.AdaptiveAvgPool1d, RelPropSimple):
+    pass
 
 class AvgPool2d(nn.AvgPool2d, RelPropSimple):
     pass
@@ -147,7 +168,6 @@ class IndexSelect(RelProp):
         return outputs
 
 
-
 class Clone(RelProp):
     def forward(self, input, num):
         self.__setattr__('num', num)
@@ -167,6 +187,7 @@ class Clone(RelProp):
         R = self.X * C
 
         return R
+
 
 class Cat(RelProp):
     def forward(self, inputs, dim):
@@ -239,7 +260,7 @@ class Conv2d(nn.Conv2d, RelProp):
 
         return F.conv_transpose2d(DY, weight, stride=self.stride, padding=self.padding, output_padding=output_padding)
 
-    def relprop(self, R, alpha):
+    def relprop(self, R, alpha):        
         if self.X.shape[1] == 3:
             pw = torch.clamp(self.weight, min=0)
             nw = torch.clamp(self.weight, max=0)
@@ -265,8 +286,8 @@ class Conv2d(nn.Conv2d, RelProp):
             nx = torch.clamp(self.X, max=0)
 
             def f(w1, w2, x1, x2):
-                Z1 = F.conv2d(x1, w1, bias=None, stride=self.stride, padding=self.padding)
-                Z2 = F.conv2d(x2, w2, bias=None, stride=self.stride, padding=self.padding)
+                Z1 = F.conv2d(x1, w1, bias=None, stride=self.stride, padding=self.padding, groups=self.groups)
+                Z2 = F.conv2d(x2, w2, bias=None, stride=self.stride, padding=self.padding, groups=self.groups)
                 S1 = safe_divide(R, Z1)
                 S2 = safe_divide(R, Z2)
                 C1 = x1 * self.gradprop(Z1, x1, S1)[0]

@@ -7,19 +7,20 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
 from timm.models.layers import to_2tuple, trunc_normal_
+from timm.models.registry import register_model
+from timm.models.helpers import build_model_with_cfg
 
 from einops import rearrange
 
-from modules.layers_ours import Add, AdaptiveAvgPool1d, BatchNorm2d, Clone, Conv2d, DropPath, Dropout, \
-    einsum, GELU, LayerNorm, Linear, Softmax
+from transformer_explainability.modules.layers_ours import Add, AdaptiveAvgPool1d, BatchNorm2d, Clone, Conv2d, DropPath, Dropout, \
+    einsum, GELU, Identity, LayerNorm, Linear, Softmax
 
 
 class Conv2d_BN(nn.Sequential):
     """
     Готово
     """
-    def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
-                 groups=1, bn_weight_init=1):
+    def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1, groups=1, bn_weight_init=1):
         super().__init__()
         self.add_module('c', Conv2d(
             a, b, ks, stride, pad, dilation, groups, bias=False))
@@ -35,7 +36,7 @@ class Conv2d_BN(nn.Sequential):
         w = c.weight * w[:, None, None, None]
         b = bn.bias - bn.running_mean * bn.weight / \
             (bn.running_var + bn.eps)**0.5
-        m = torch.nn.Conv2d(w.size(1) * self.c.groups, w.size(0), w.shape[2:], 
+        m = Conv2d(w.size(1) * self.c.groups, w.size(0), w.shape[2:], 
             stride=self.c.stride, padding=self.c.padding, dilation=self.c.dilation, groups=self.c.groups
         )
         m.weight.data.copy_(w)
@@ -92,6 +93,7 @@ class PatchMerging(nn.Module):
         self.conv3 = Conv2d_BN(out_dim, out_dim, 1, 1, 0)
 
     def forward(self, x):
+        self.ndim = x.ndim
         if x.ndim == 3:
             H, W = self.input_resolution
             B = len(x)
@@ -108,18 +110,20 @@ class PatchMerging(nn.Module):
         return x
     
     def relprop(self, cam, **kwargs):
-        """
-        Надо подумать, что делать, если x.ndim==3
-        """
         B, HW, C = cam.shape
         H, W = self.input_resolution
-        cam = cam.transpose(1, 2).reshape(B, C, H, W)
+        cam = cam.transpose(1, 2).reshape(B, C, H // 2, W // 2)
 
         cam = self.conv3.relprop(cam, **kwargs)
         cam = self.act.relprop(cam, **kwargs)
         cam = self.conv2.relprop(cam, **kwargs)
         cam = self.act.relprop(cam, **kwargs)
-        cam = self.conv1.relprop(cam, **kwargs) 
+        cam = self.conv1.relprop(cam, **kwargs)
+
+        if self.ndim == 3:
+            B = len(cam)
+            H, W = self.input_resolution
+            cam = cam.permute(0, 2, 3, 1).reshape(B, H * W, -1)
         return cam
     
 
@@ -147,8 +151,7 @@ class MBConv(nn.Module):
             self.hidden_chans, out_chans, ks=1, bn_weight_init=0.0)
         self.act3 = activation()
 
-        self.drop_path = DropPath(
-            drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else Identity()
         
         self.add = Add()
 
@@ -186,7 +189,7 @@ class MBConv(nn.Module):
         cam1 = self.act1.relprop(cam1, **kwargs) 
         cam1 = self.conv1.relprop(cam1, **kwargs) 
         
-        cam = self.clone.relprop(cam1, cam2)
+        cam = self.clone.relprop((cam1, cam2), **kwargs)
 
         return cam
 
@@ -236,7 +239,7 @@ class ConvLayer(nn.Module):
         if self.downsample is not None:
             cam = self.downsample.relprop(cam, **kwargs)
         for blk in reversed(self.blocks):
-            cam = self.relprop(cam, **kwargs)
+            cam = blk.relprop(cam, **kwargs)
         return cam
     
 
@@ -345,6 +348,7 @@ class Attention(nn.Module):
         cam_attn, cam_v = self.matmul2.relprop(cam, **kwargs)
         cam_attn /= 2
         cam_v /= 2
+
         self.save_v_cam(cam_v)
         self.save_attn_cam(cam_attn)
 
@@ -354,6 +358,7 @@ class Attention(nn.Module):
         cam_k /= 2
 
         cam = rearrange([cam_q, cam_k, cam_v], 'qkv b h n d -> b n (qkv h d)', qkv=3, h=self.num_heads)
+        cam = self.qkv.relprop(cam, **kwargs)
         
         cam = self.norm.relprop(cam, **kwargs)
 
@@ -416,7 +421,7 @@ class TinyViTBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7,
                  mlp_ratio=4., drop=0., drop_path=0.,
                  local_conv_size=3,
-                 activation=nn.GELU,
+                 activation=GELU,
                  ):
         super().__init__()
         self.dim = dim
@@ -427,8 +432,7 @@ class TinyViTBlock(nn.Module):
         self.mlp_ratio = mlp_ratio
 
         self.clone1 = Clone()
-        self.drop_path = DropPath(
-            drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else Identity()
 
         assert dim % num_heads == 0, 'dim must be divisible by num_heads'
         head_dim = dim // num_heads
@@ -486,7 +490,7 @@ class TinyViTBlock(nn.Module):
 
             x = x.view(B, L, C)
 
-        x = self.add1(res_x, self.drop_path(x))
+        x = self.add1([res_x, self.drop_path(x)])
 
         x = x.transpose(1, 2).reshape(B, C, H, W)
         # x.shape: (B, C, H, W)
@@ -495,7 +499,6 @@ class TinyViTBlock(nn.Module):
         x = x.view(B, C, L).transpose(1, 2)
 
         x1, x2 = self.clone2(x, 2)
-
         x = self.add2([x1, self.drop_path(self.mlp(x2))])
         return x
 
@@ -506,8 +509,8 @@ class TinyViTBlock(nn.Module):
     def relprop(self, cam , **kwargs):
         cam1, cam2 = self.add2.relprop(cam, **kwargs)
         cam2 = self.drop_path.relprop(cam2, **kwargs)
-
-        cam = self.clone2.relprop(cam1, cam2, **kwargs)
+        cam2 = self.mlp.relprop(cam2, **kwargs)
+        cam = self.clone2.relprop((cam1, cam2), **kwargs)
 
         B, L, C = cam.shape
         H, W = self.input_resolution
@@ -539,13 +542,13 @@ class TinyViTBlock(nn.Module):
             cam = cam.view(B, nH, self.window_size, nW, self.window_size, C).transpose(2, 3).reshape(
                 B * nH * nW, self.window_size * self.window_size, C
             )
-            cam = self.attn(cam, **kwargs)
+            cam = self.attn.relprop(cam, **kwargs)
             cam = cam.view(B, nH, nW, self.window_size, self.window_size,
                        C).transpose(2, 3).reshape(B, pH, pW, C)
             
-            cam = cam[:, :H, :W]
+            cam = cam[:, :H, :W].view(B, L, C)
 
-        cam = self.clone1.relprop(res_cam, cam, **kwargs)
+        cam = self.clone1.relprop((res_cam, cam), **kwargs)
         
         return cam
 
@@ -623,7 +626,7 @@ class BasicLayer(nn.Module):
         if self.downsample is not None:
             cam = self.downsample.relprop(cam , **kwargs)
         for blk in self.blocks:
-            cam = blk.relprop(cam)
+            cam = blk.relprop(cam, **kwargs)
         return cam
 
 
@@ -696,7 +699,7 @@ class TinyViT(nn.Module):
         # Classifier head
         self.norm_head = LayerNorm(embed_dims[-1])
         self.head = Linear(
-            embed_dims[-1], num_classes) if num_classes > 0 else torch.nn.Identity()
+            embed_dims[-1], num_classes) if num_classes > 0 else Identity()
 
         # init weights
         self.apply(self._init_weights)
@@ -739,11 +742,11 @@ class TinyViT(nn.Module):
         self.apply(_check_lr_scale)
 
     def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
+        if isinstance(m, Linear):
             trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+            if isinstance(m, Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
+        elif isinstance(m, LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
@@ -763,12 +766,19 @@ class TinyViT(nn.Module):
             x = layer(x)
 
         if not self.drop_head:
-            N, C, H, W = x.shape
-            x = x.view(N, C, H * W)
-            x = self.avgpool(x).squeeze()
+            x = self.avgpool(x.transpose(1, 2)).squeeze(2)
             # x = x.mean(1)
 
         return x
+    
+    def relprop_features(self, cam, **kwargs):
+        if not self.drop_head:
+            cam = self.avgpool.relprop(cam.unsqueeze(2), **kwargs).transpose(1, 2)
+
+        for i, layer in enumerate(reversed(self.layers)):
+            cam = layer.relprop(cam, **kwargs)
+        cam = self.patch_embed.relprop(cam, **kwargs)
+        return cam
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -776,22 +786,61 @@ class TinyViT(nn.Module):
             x = self.norm_head(x)
             x = self.head(x)
         return x
-    
-    def relprop_features(self, cam, **kwargs):
-        H, W = self.layers[-1].input_resolution
-        if not self.drop_head:
-            N, C, _ = cam.shape
-            cam = self.avgpool.relprop(cam.unsqueeze(2), **kwargs)
-            cam = cam.reshape(N, C, H, W)
 
-        for i in range(len(self.layers) - 1, -1, -1):
-            layer = self.layers[i]
-            cam = layer.relprop(cam, **kwargs)
-        cam = self.patch_embed.relprop(cam)
-
-    def relprop(self, cam, **kwargs):
+    def relprop(self, cam=None, method="transformer_attribution", is_ablation=False, start_layer=0, **kwargs):
         if not self.drop_head:
             cam = self.head.relprop(cam, **kwargs)
             cam = self.norm_head.relprop(cam, **kwargs)
         cam = self.relprop_features(cam, **kwargs)
         return cam
+    
+_checkpoint_url_format = \
+    'https://github.com/wkcn/TinyViT-model-zoo/releases/download/checkpoints/{}.pth'
+
+
+def _create_tiny_vit(variant, pretrained=False, **kwargs):
+    # pretrained_type: 22kto1k_distill, 1k, 22k_distill
+    pretrained_type = kwargs.pop('pretrained_type', '22kto1k_distill')
+    assert pretrained_type in ['22kto1k_distill', '1k', '22k_distill'], \
+        'pretrained_type should be one of 22kto1k_distill, 1k, 22k_distill'
+
+    img_size = kwargs.get('img_size', 224)
+    if img_size != 224:
+        pretrained_type = pretrained_type.replace('_', f'_{img_size}_')
+
+    num_classes_pretrained = 21841 if \
+        pretrained_type  == '22k_distill' else 1000
+
+    variant_without_img_size = '_'.join(variant.split('_')[:-1])
+    cfg = dict(
+        url=_checkpoint_url_format.format(
+            f'{variant_without_img_size}_{pretrained_type}'),
+        num_classes=num_classes_pretrained,
+        classifier='head',
+    )
+
+    def _pretrained_filter_fn(state_dict):
+        state_dict = state_dict['model']
+        # filter out attention_bias_idxs
+        state_dict = {k: v for k, v in state_dict.items() if \
+            not k.endswith('attention_bias_idxs')}
+        return state_dict
+
+    return build_model_with_cfg(
+        TinyViT, variant, pretrained,
+        pretrained_cfg=cfg,
+        pretrained_filter_fn=_pretrained_filter_fn,
+        **kwargs)
+    
+
+@register_model
+def tiny_vit_21m_224(pretrained=False, **kwargs):
+    model_kwargs = dict(
+        embed_dims=[96, 192, 384, 576],
+        depths=[2, 2, 6, 2],
+        num_heads=[3, 6, 12, 18],
+        window_sizes=[7, 7, 14, 7],
+        drop_path_rate=0.2,
+    )
+    model_kwargs.update(kwargs)
+    return _create_tiny_vit('tiny_vit_21m_224', pretrained, **model_kwargs)
