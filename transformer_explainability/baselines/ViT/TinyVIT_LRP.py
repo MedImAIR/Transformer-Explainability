@@ -310,8 +310,14 @@ class Attention(nn.Module):
     def save_attn_cam(self, cam):
         self.attn_cam = cam
 
+    def get_attn_cam(self):
+        return self.attn_cam
+
     def save_attn_gradients(self, attn_gradients):
         self.attn_gradients = attn_gradients
+
+    def get_attn_gradients(self):
+        return self.attn_gradients
     
     def forward(self, x):  # x (B,N,C)
         B, N, _ = x.shape
@@ -770,15 +776,6 @@ class TinyViT(nn.Module):
             # x = x.mean(1)
 
         return x
-    
-    def relprop_features(self, cam, **kwargs):
-        if not self.drop_head:
-            cam = self.avgpool.relprop(cam.unsqueeze(2), **kwargs).transpose(1, 2)
-
-        for i, layer in enumerate(reversed(self.layers)):
-            cam = layer.relprop(cam, **kwargs)
-        cam = self.patch_embed.relprop(cam, **kwargs)
-        return cam
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -791,8 +788,62 @@ class TinyViT(nn.Module):
         if not self.drop_head:
             cam = self.head.relprop(cam, **kwargs)
             cam = self.norm_head.relprop(cam, **kwargs)
-        cam = self.relprop_features(cam, **kwargs)
+
+        if not self.drop_head:
+            cam = self.avgpool.relprop(cam.unsqueeze(2), **kwargs).transpose(1, 2)
+
+        for i, layer in enumerate(reversed(self.layers[1:])):
+            cam = layer.relprop(cam, **kwargs)
+
+        if method == "full":
+            cam = self.layers[0].relprop(cam, **kwargs)
+            cam = self.patch_embed.relprop(cam, **kwargs)
+            # sum on channels
+            cam = cam.sum(dim=1)
+            return cam
+        
+        elif method == "rollout":
+            # cam rollout
+            attn_cams = []
+            for layer in self.layers[1:]:
+                for blk in layer.blocks:
+                    attn_heads = blk.attn.get_attn_cam().clamp(min=0)
+                    avg_heads = (attn_heads.sum(dim=1) / attn_heads.shape[1]).detach()
+                    attn_cams.append(avg_heads)
+            cam = compute_rollout_attention(attn_cams, start_layer=start_layer)
+            cam = cam[:, 0, 1:]
+            return cam
+        
+        # our method, method name grad is legacy
+        elif method == "transformer_attribution" or method == "grad":
+            cams = []
+            for layer in self.layers[1:]:
+                for blk in layer.blocks:
+                    grad = blk.attn.get_attn_gradients()
+                    cam = blk.attn.get_attn_cam()
+                    cam = cam[0].reshape(-1, cam.shape[-1], cam.shape[-1])
+                    grad = grad[0].reshape(-1, grad.shape[-1], grad.shape[-1])
+                    cam = grad * cam
+                    cam = cam.clamp(min=0).mean(dim=0)
+                    cams.append(cam.unsqueeze(0))
+            rollout = compute_rollout_attention(cams, start_layer=start_layer)
+            cam = rollout[:, 0, 1:]
+            return cam
+
         return cam
+    
+def compute_rollout_attention(all_layer_matrices, start_layer=0):
+    # adding residual consideration
+    num_tokens = all_layer_matrices[0].shape[1]
+    batch_size = all_layer_matrices[0].shape[0]
+    eye = torch.eye(num_tokens).expand(batch_size, num_tokens, num_tokens).to(all_layer_matrices[0].device)
+    all_layer_matrices = [all_layer_matrices[i] + eye for i in range(len(all_layer_matrices))]
+    # all_layer_matrices = [all_layer_matrices[i] / all_layer_matrices[i].sum(dim=-1, keepdim=True)
+    #                       for i in range(len(all_layer_matrices))]
+    joint_attention = all_layer_matrices[start_layer]
+    for i in range(start_layer+1, len(all_layer_matrices)):
+        joint_attention = all_layer_matrices[i].bmm(joint_attention)
+    return joint_attention
     
 _checkpoint_url_format = \
     'https://github.com/wkcn/TinyViT-model-zoo/releases/download/checkpoints/{}.pth'
